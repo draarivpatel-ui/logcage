@@ -1,5 +1,7 @@
 # logcage
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/draarivpatel-ui/logcage/badge)](https://scorecard.dev/viewer/?uri=github.com/draarivpatel-ui/logcage)
+
 Zero-dependency CWE-117 log injection, terminal escape sanitization and automatic secret redaction for Node.js.
 
 `logcage` is a small, auditable security library for applications that write untrusted values into text logs. It neutralizes line breaks, terminal control sequences, bidirectional overrides, invisible format characters and lone surrogates; redacts common credential shapes and caller-supplied secrets; sanitizes structured records without mutating them; and emits single-line NDJSON entries that cannot be split into multiple log lines by input-controlled characters. It works in ESM and CommonJS with strict TypeScript declarations and no runtime dependencies.
