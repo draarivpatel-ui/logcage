@@ -1,0 +1,1472 @@
+/*
+ * logcage core.
+ *
+ * Zero runtime dependencies. The CommonJS build in cjs/index.cjs is generated
+ * from this file by scripts/build-cjs.mjs so both module formats have identical
+ * behavior.
+ */
+
+export const CODE = Object.freeze({
+  INVALID_INPUT: 'ERR_LOGCAGE_INVALID_INPUT',
+  INVALID_OPTIONS: 'ERR_LOGCAGE_INVALID_OPTIONS',
+  LIMIT_EXCEEDED: 'ERR_LOGCAGE_LIMIT_EXCEEDED',
+  OUTPUT_INVARIANT: 'ERR_LOGCAGE_OUTPUT_INVARIANT'
+});
+
+const DEFAULT_TRUNCATION_MARKER = '[truncated]';
+const DEFAULT_REPLACEMENT = '[REDACTED]';
+const MIN_MAX_LENGTH = 16;
+const MAX_MAX_LENGTH = 1048576;
+const MAX_EXTRA_SECRETS = 64;
+const MAX_EXTRA_SECRET_LENGTH = 4096;
+const MAX_SENSITIVE_KEYS = 128;
+const MAX_REDACT_PATHS = 128;
+const MAX_PATH_SEGMENTS = 64;
+const MAX_KEY_LENGTH = 128;
+const MAX_PATH_TEXT_LENGTH = 512;
+
+const LINE_OPTION_KEYS = Object.freeze(['mode', 'maxLength', 'truncationMarker']);
+const REDACT_OPTION_KEYS = Object.freeze(['replacement', 'extraSecrets', 'pii']);
+const RECORD_ONLY_OPTION_KEYS = Object.freeze([
+  'maxDepth', 'maxKeys', 'maxArrayLength', 'maxNodes', 'sensitiveKeys', 'redactPaths'
+]);
+const JSON_ONLY_OPTION_KEYS = Object.freeze(['timestamp', 'maxOutputBytes']);
+const RECORD_OPTION_KEYS = Object.freeze([
+  ...LINE_OPTION_KEYS, ...REDACT_OPTION_KEYS, ...RECORD_ONLY_OPTION_KEYS
+]);
+const JSON_OPTION_KEYS = Object.freeze([...RECORD_OPTION_KEYS, ...JSON_ONLY_OPTION_KEYS]);
+const ALL_OPTION_KEYS = JSON_OPTION_KEYS;
+
+const CONSOLE_METHODS = Object.freeze(['log', 'info', 'warn', 'error', 'debug', 'trace']);
+const RESERVED_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+const BUILTIN_SENSITIVE_KEYS = new Set([
+  'password', 'passwd', 'pwd', 'secret', 'token', 'apikey', 'authorization',
+  'cookie', 'setcookie', 'privatekey', 'accesstoken', 'refreshtoken',
+  'clientsecret', 'sessionid', 'ssn', 'creditcard', 'csrftoken', 'xsrftoken',
+  'secretaccesskey', 'awssecretaccesskey', 'accesskey', 'sessionkey', 'encryptionkey'
+]);
+
+const GENERIC_SECRET_KEYS = Object.freeze([
+  'awssecretaccesskey', 'secretaccesskey', 'accesstoken', 'refreshtoken',
+  'clientsecret', 'privatekey', 'sessionid', 'creditcard', 'password',
+  'passwd', 'apikey', 'secret', 'token', 'ssn'
+].sort((a, b) => b.length - a.length));
+
+export class LogCageError extends Error {
+  constructor(code, reason, details = {}) {
+    super(reason);
+    this.name = 'LogCageError';
+    this.code = code;
+    this.reason = reason;
+    if (details.field !== undefined) this.field = details.field;
+    if (details.limit !== undefined) this.limit = details.limit;
+    if (details.actual !== undefined) this.actual = details.actual;
+  }
+
+  toJSON() {
+    const output = {
+      name: this.name,
+      code: this.code,
+      reason: this.reason,
+      message: this.message
+    };
+    if (this.field !== undefined) output.field = this.field;
+    if (this.limit !== undefined) output.limit = this.limit;
+    if (this.actual !== undefined) output.actual = this.actual;
+    return output;
+  }
+}
+
+function fail(code, reason, details) {
+  throw new LogCageError(code, reason, details);
+}
+
+function invalidInput(reason) {
+  fail(CODE.INVALID_INPUT, reason);
+}
+
+function invalidOptions(reason, field) {
+  fail(CODE.INVALID_OPTIONS, reason, field === undefined ? undefined : { field });
+}
+
+function isObjectLike(value) {
+  return value !== null && (typeof value === 'object' || typeof value === 'function');
+}
+
+function optionsObject(options, label) {
+  if (options === undefined) return {};
+  if (!isObjectLike(options) || Array.isArray(options)) invalidInput(label + ' must be an object');
+  return options;
+}
+
+function assertKnownKeys(options, allowedKeys) {
+  const allowed = new Set(allowedKeys);
+  for (const key of Object.keys(options)) {
+    if (!allowed.has(key)) invalidOptions('options contain an unknown key');
+  }
+}
+
+function booleanValue(value, fallback, field) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'boolean') invalidOptions(field + ' must be a boolean', field);
+  return value;
+}
+
+function integerValue(value, fallback, min, max, field) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max) {
+    invalidOptions(field + ' must be a safe integer in range', field);
+  }
+  return value;
+}
+
+function stringValue(value, fallback, min, max, field) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'string' || value.length < min || value.length > max) {
+    invalidOptions(field + ' must be a string in range', field);
+  }
+  return value;
+}
+
+function isAsciiAlpha(code) {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isAsciiDigit(code) {
+  return code >= 48 && code <= 57;
+}
+
+function isAsciiAlphaNumeric(code) {
+  return isAsciiAlpha(code) || isAsciiDigit(code);
+}
+
+function asciiLower(ch) {
+  const code = ch.charCodeAt(0);
+  return code >= 65 && code <= 90 ? String.fromCharCode(code + 32) : ch;
+}
+
+function startsWithAsciiAt(text, index, pattern) {
+  if (index + pattern.length > text.length) return false;
+  for (let i = 0; i < pattern.length; i += 1) {
+    if (text.charCodeAt(index + i) !== pattern.charCodeAt(i)) return false;
+  }
+  return true;
+}
+
+function startsWithAsciiCaseInsensitiveAt(text, index, pattern) {
+  if (index + pattern.length > text.length) return false;
+  for (let i = 0; i < pattern.length; i += 1) {
+    if (asciiLower(text[index + i]) !== asciiLower(pattern[i])) return false;
+  }
+  return true;
+}
+
+function isUnsafeControlOrFormat(cp) {
+  if (cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f)) return true;
+  if (cp === 0x2028 || cp === 0x2029) return true;
+  if (cp === 0x00ad) return true;
+  if (cp >= 0x0600 && cp <= 0x0605) return true;
+  if (cp === 0x061c || cp === 0x06dd || cp === 0x070f) return true;
+  if (cp === 0x0890 || cp === 0x0891 || cp === 0x08e2) return true;
+  if (cp === 0x180e) return true;
+  if (cp >= 0x200b && cp <= 0x200f) return true;
+  if (cp >= 0x202a && cp <= 0x202e) return true;
+  if (cp >= 0x2060 && cp <= 0x206f) return true;
+  if (cp === 0xfeff) return true;
+  if (cp >= 0xfe00 && cp <= 0xfe0f) return true;
+  if (cp >= 0xfff9 && cp <= 0xfffb) return true;
+  if (cp === 0x110bd || cp === 0x110cd) return true;
+  if (cp >= 0x13430 && cp <= 0x1343f) return true;
+  if (cp >= 0x1bca0 && cp <= 0x1bca3) return true;
+  if (cp >= 0x1d173 && cp <= 0x1d17a) return true;
+  if (cp === 0xe0001) return true;
+  if (cp >= 0xe0020 && cp <= 0xe007f) return true;
+  if (cp >= 0xe0100 && cp <= 0xe01ef) return true;
+  if (cp >= 0xfdd0 && cp <= 0xfdef) return true;
+  if ((cp & 0xfffe) === 0xfffe) return true;
+  return false;
+}
+
+function isHighSurrogate(code) {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code) {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+function hasUnsafeMarkerCharacter(text) {
+  for (let i = 0; i < text.length; i += 1) {
+    const first = text.charCodeAt(i);
+    if (isHighSurrogate(first) || isLowSurrogate(first)) {
+      if (isHighSurrogate(first) && i + 1 < text.length && isLowSurrogate(text.charCodeAt(i + 1))) {
+        const cp = ((first - 0xd800) << 10) + text.charCodeAt(i + 1) - 0xdc00 + 0x10000;
+        if (isUnsafeControlOrFormat(cp)) return true;
+        i += 1;
+        continue;
+      }
+      return true;
+    }
+    if (isUnsafeControlOrFormat(first)) return true;
+  }
+  return false;
+}
+
+function normalizeStringArray(value, fallback, maxCount, maxLength, field) {
+  if (value === undefined) return fallback;
+  if (!Array.isArray(value) || value.length > maxCount) invalidOptions(field + ' must be an array within the count limit', field);
+  const output = [];
+  for (const item of value) {
+    if (typeof item !== 'string' || item.length === 0 || item.length > maxLength) {
+      invalidOptions(field + ' entries must be non-empty strings within the length limit', field);
+    }
+    output.push(item);
+  }
+  return Object.freeze(output);
+}
+
+function normalizePii(value) {
+  if (value === undefined) {
+    return Object.freeze({ email: false, luhnCard: false, ssn: false, ipv4: false });
+  }
+  if (!isObjectLike(value) || Array.isArray(value)) invalidOptions('pii must be an object', 'pii');
+  const allowed = new Set(['email', 'luhnCard', 'ssn', 'ipv4']);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) invalidOptions('pii contains an unknown key', 'pii');
+  }
+  return Object.freeze({
+    email: booleanValue(value.email, false, 'pii.email'),
+    luhnCard: booleanValue(value.luhnCard, false, 'pii.luhnCard'),
+    ssn: booleanValue(value.ssn, false, 'pii.ssn'),
+    ipv4: booleanValue(value.ipv4, false, 'pii.ipv4')
+  });
+}
+
+function normalizeKeyName(key) {
+  let output = '';
+  for (let i = 0; i < key.length; i += 1) {
+    let code = key.charCodeAt(i);
+    let width = 1;
+    if (isHighSurrogate(code) && i + 1 < key.length && isLowSurrogate(key.charCodeAt(i + 1))) {
+      code = ((code - 0xd800) << 10) + key.charCodeAt(i + 1) - 0xdc00 + 0x10000;
+      width = 2;
+    }
+    const ch = key.slice(i, i + width);
+    if (ch === '_' || ch === '-' || ch === '.' || ch === ' ' || ch === '\t') {
+      i += width - 1;
+      continue;
+    }
+    if (!isUnsafeControlOrFormat(code)) {
+      if (code >= 65 && code <= 90) output += String.fromCharCode(code + 32);
+      else output += ch;
+    }
+    i += width - 1;
+  }
+  return output;
+}
+
+function normalizeSensitiveKeys(value) {
+  const normalized = new Set(BUILTIN_SENSITIVE_KEYS);
+  if (value === undefined) return normalized;
+  if (!Array.isArray(value) || value.length > MAX_SENSITIVE_KEYS) {
+    invalidOptions('sensitiveKeys must be an array within the count limit', 'sensitiveKeys');
+  }
+  for (const key of value) {
+    if (typeof key !== 'string' || key.length === 0 || key.length > MAX_KEY_LENGTH) {
+      invalidOptions('sensitiveKeys entries must be non-empty strings within the length limit', 'sensitiveKeys');
+    }
+    const canonical = normalizeKeyName(key);
+    if (canonical.length === 0) invalidOptions('sensitiveKeys entries must contain a key character', 'sensitiveKeys');
+    normalized.add(canonical);
+  }
+  return normalized;
+}
+
+function normalizePathEntry(entry) {
+  let segments;
+  if (typeof entry === 'string') {
+    if (entry.length === 0 || entry.length > MAX_PATH_TEXT_LENGTH) {
+      invalidOptions('redactPaths entries must be strings within the length limit', 'redactPaths');
+    }
+    segments = entry.split('.');
+  } else if (Array.isArray(entry)) {
+    if (entry.length === 0 || entry.length > MAX_PATH_SEGMENTS) {
+      invalidOptions('redactPaths array entries must have a bounded segment count', 'redactPaths');
+    }
+    segments = entry;
+  } else {
+    invalidOptions('redactPaths entries must be strings or arrays of strings', 'redactPaths');
+  }
+  const normalized = [];
+  for (const segment of segments) {
+    if (typeof segment !== 'string' || segment.length === 0 || segment.length > MAX_KEY_LENGTH) {
+      invalidOptions('redactPaths segments must be non-empty strings within the length limit', 'redactPaths');
+    }
+    const canonical = normalizeKeyName(segment);
+    if (canonical.length === 0) invalidOptions('redactPaths segments must contain a key character', 'redactPaths');
+    normalized.push(canonical);
+  }
+  return Object.freeze(normalized);
+}
+
+function normalizeRedactPaths(value) {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value) || value.length > MAX_REDACT_PATHS) {
+    invalidOptions('redactPaths must be an array within the count limit', 'redactPaths');
+  }
+  return Object.freeze(value.map(normalizePathEntry));
+}
+
+function normalizeTimestamp(value) {
+  if (value === undefined) return undefined;
+  if (typeof value === 'string') {
+    if (value.length === 0 || value.length > 128) invalidOptions('timestamp must be a string within the length limit', 'timestamp');
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || Math.abs(value) > 8640000000000000) {
+      invalidOptions('timestamp number must be a finite valid Date time', 'timestamp');
+    }
+    return value;
+  }
+  if (value instanceof Date) {
+    if (!Number.isFinite(value.getTime())) invalidOptions('timestamp Date must be valid', 'timestamp');
+    return new Date(value.getTime());
+  }
+  invalidOptions('timestamp must be a string, finite number or valid Date', 'timestamp');
+}
+
+function normalizeOptions(options, allowedKeys) {
+  const input = optionsObject(options, 'options');
+  assertKnownKeys(input, allowedKeys);
+
+  const mode = input.mode === undefined ? 'escape' : input.mode;
+  if (mode !== 'escape' && mode !== 'strip') invalidOptions('mode must be escape or strip', 'mode');
+
+  const truncationMarker = stringValue(input.truncationMarker, DEFAULT_TRUNCATION_MARKER, 1, 64, 'truncationMarker');
+  if (hasUnsafeMarkerCharacter(truncationMarker)) invalidOptions('truncationMarker contains an unsafe control or format character', 'truncationMarker');
+  const maxLength = integerValue(input.maxLength, 4096, MIN_MAX_LENGTH, MAX_MAX_LENGTH, 'maxLength');
+  if (maxLength <= truncationMarker.length) {
+    invalidOptions('maxLength must be greater than truncationMarker length', 'maxLength');
+  }
+
+  const replacement = stringValue(input.replacement, DEFAULT_REPLACEMENT, 1, 128, 'replacement');
+  if (hasUnsafeMarkerCharacter(replacement)) invalidOptions('replacement contains an unsafe control or format character', 'replacement');
+  const extraSecrets = normalizeStringArray(input.extraSecrets, Object.freeze([]), MAX_EXTRA_SECRETS, MAX_EXTRA_SECRET_LENGTH, 'extraSecrets');
+  const pii = normalizePii(input.pii);
+
+  const cfg = {
+    mode,
+    maxLength,
+    truncationMarker,
+    replacement,
+    extraSecrets,
+    pii,
+    maxDepth: integerValue(input.maxDepth, 12, 1, 64, 'maxDepth'),
+    maxKeys: integerValue(input.maxKeys, 200, 1, 10000, 'maxKeys'),
+    maxArrayLength: integerValue(input.maxArrayLength, 200, 1, 10000, 'maxArrayLength'),
+    maxNodes: integerValue(input.maxNodes, 2000, 1, 100000, 'maxNodes'),
+    sensitiveKeys: normalizeSensitiveKeys(input.sensitiveKeys),
+    redactPaths: normalizeRedactPaths(input.redactPaths),
+    timestamp: normalizeTimestamp(input.timestamp),
+    maxOutputBytes: integerValue(input.maxOutputBytes, 262144, 1024, 4194304, 'maxOutputBytes')
+  };
+  return Object.freeze(cfg);
+}
+
+function assertStringInput(value, label) {
+  if (typeof value !== 'string') invalidInput(label + ' must be a string');
+}
+
+function hex2(cp) {
+  return cp.toString(16).padStart(2, '0');
+}
+
+function hex4(cp) {
+  return cp.toString(16).padStart(4, '0');
+}
+
+function escapeForCodePoint(cp) {
+  if (cp === 10) return '\\n';
+  if (cp === 13) return '\\r';
+  if (cp === 9) return '\\t';
+  if (cp <= 0xff) return '\\x' + hex2(cp);
+  if (cp <= 0xffff) return '\\u' + hex4(cp);
+  return '\\u{' + cp.toString(16) + '}';
+}
+
+function scanCsiSequence(text, index) {
+  let i = index;
+  while (i < text.length) {
+    const code = text.charCodeAt(i);
+    if (code >= 0x40 && code <= 0x7e) return i + 1;
+    i += 1;
+  }
+  return i;
+}
+
+function scanStringControlSequence(text, index, allowBel) {
+  let i = index;
+  while (i < text.length) {
+    const code = text.charCodeAt(i);
+    if (allowBel && code === 0x07) return i + 1;
+    if (code === 0x9c) return i + 1;
+    if (code === 0x1b) {
+      if (i + 1 < text.length && text.charCodeAt(i + 1) === 0x5c) return i + 2;
+    }
+    i += 1;
+  }
+  return i;
+}
+
+function scanEscapeSequence(text, index) {
+  if (index + 1 >= text.length) return index + 1;
+  const next = text.charCodeAt(index + 1);
+  if (next === 0x5b) return scanCsiSequence(text, index + 2);
+  if (next === 0x5d) return scanStringControlSequence(text, index + 2, true);
+  if (next === 0x50 || next === 0x58 || next === 0x5e || next === 0x5f) {
+    return scanStringControlSequence(text, index + 2, false);
+  }
+  if (next === 0x1b) return index + 1;
+  if ((next >= 0x28 && next <= 0x2b) || next === 0x23 || next === 0x25 || next === 0x20) {
+    return Math.min(index + 3, text.length);
+  }
+  return Math.min(index + 2, text.length);
+}
+
+function scanC1ControlSequence(text, index, cp) {
+  if (cp === 0x9b) return scanCsiSequence(text, index + 1);
+  if (cp === 0x9d) return scanStringControlSequence(text, index + 1, true);
+  if (cp === 0x90 || cp === 0x98 || cp === 0x9e || cp === 0x9f) {
+    return scanStringControlSequence(text, index + 1, false);
+  }
+  return index + 1;
+}
+
+function createTruncatingAppender(maxLength, marker) {
+  const chunks = [];
+  let length = 0;
+  let truncated = false;
+  const trimForMarker = () => {
+    const capacity = maxLength - marker.length;
+    while (length > capacity && chunks.length > 0) {
+      const removed = chunks.pop();
+      length -= removed.length;
+    }
+  };
+  return {
+    append(token) {
+      if (token.length === 0 || truncated) return;
+      if (length + token.length <= maxLength) {
+        chunks.push(token);
+        length += token.length;
+        return;
+      }
+      truncated = true;
+      trimForMarker();
+    },
+    finish() {
+      const body = chunks.join('');
+      return truncated ? body + marker : body;
+    },
+    wasTruncated() {
+      return truncated;
+    }
+  };
+}
+
+function sanitizeLineCore(input, cfg) {
+  const output = createTruncatingAppender(cfg.maxLength, cfg.truncationMarker);
+  let i = 0;
+  while (i < input.length) {
+    const first = input.charCodeAt(i);
+
+    if (first === 0x1b) {
+      i = scanEscapeSequence(input, i);
+      continue;
+    }
+
+    let cp = first;
+    let width = 1;
+    let loneSurrogate = false;
+    if (isHighSurrogate(first)) {
+      if (i + 1 < input.length && isLowSurrogate(input.charCodeAt(i + 1))) {
+        cp = ((first - 0xd800) << 10) + input.charCodeAt(i + 1) - 0xdc00 + 0x10000;
+        width = 2;
+      } else {
+        loneSurrogate = true;
+      }
+    } else if (isLowSurrogate(first)) {
+      loneSurrogate = true;
+    }
+
+    if (!loneSurrogate && (cp === 0x90 || cp === 0x98 || cp === 0x9b || cp === 0x9d || cp === 0x9e || cp === 0x9f)) {
+      i = scanC1ControlSequence(input, i, cp);
+      continue;
+    }
+
+    if (loneSurrogate || isUnsafeControlOrFormat(cp)) {
+      output.append(cfg.mode === 'escape' ? escapeForCodePoint(cp) : '');
+    } else {
+      output.append(input.slice(i, i + width));
+    }
+    i += width;
+  }
+  return output.finish();
+}
+
+export function sanitizeLogLine(input, options) {
+  assertStringInput(input, 'input');
+  const cfg = normalizeOptions(options, LINE_OPTION_KEYS);
+  return sanitizeLineCore(input, cfg);
+}
+
+function utf8Bytes(text) {
+  const bytes = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const first = text.charCodeAt(i);
+    let cp = first;
+    if (isHighSurrogate(first) && i + 1 < text.length && isLowSurrogate(text.charCodeAt(i + 1))) {
+      cp = ((first - 0xd800) << 10) + text.charCodeAt(i + 1) - 0xdc00 + 0x10000;
+      i += 1;
+    }
+    if (cp < 0x80) {
+      bytes.push(cp);
+    } else if (cp < 0x800) {
+      bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+    } else if (cp < 0x10000) {
+      bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    } else {
+      bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    }
+  }
+  return bytes;
+}
+
+function isUriUnreservedByte(byte) {
+  return isAsciiAlphaNumeric(byte) || byte === 45 || byte === 95 || byte === 46 || byte === 33 ||
+    byte === 126 || byte === 42 || byte === 39 || byte === 40 || byte === 41;
+}
+
+function percentEncodeUtf8(text, uppercase) {
+  const bytes = utf8Bytes(text);
+  let output = '';
+  for (const byte of bytes) {
+    if (isUriUnreservedByte(byte)) output += String.fromCharCode(byte);
+    else {
+      const hex = byte.toString(16).padStart(2, '0');
+      output += '%' + (uppercase ? hex.toUpperCase() : hex.toLowerCase());
+    }
+  }
+  return output;
+}
+
+function base64EncodeUtf8(text, urlSafe) {
+  const alphabet = urlSafe
+    ? 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+    : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const bytes = utf8Bytes(text);
+  let output = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i];
+    const hasB = i + 1 < bytes.length;
+    const hasC = i + 2 < bytes.length;
+    const b = hasB ? bytes[i + 1] : 0;
+    const c = hasC ? bytes[i + 2] : 0;
+    output += alphabet[a >> 2];
+    output += alphabet[((a & 3) << 4) | (b >> 4)];
+    output += hasB ? alphabet[((b & 15) << 2) | (c >> 6)] : '=';
+    output += hasC ? alphabet[c & 63] : '=';
+  }
+  return output;
+}
+
+function replaceExactAll(text, search, replacement) {
+  if (search.length === 0 || text.length === 0) return text;
+  let index = 0;
+  let output = '';
+  let found = false;
+  while (index <= text.length) {
+    const at = text.indexOf(search, index);
+    if (at === -1) break;
+    found = true;
+    output += text.slice(index, at) + replacement;
+    index = at + search.length;
+  }
+  if (!found) return text;
+  return output + text.slice(index);
+}
+
+function secretVariants(secret) {
+  const variants = [];
+  const seen = new Set();
+  const add = (value, priority) => {
+    if (value.length > 0 && !seen.has(value)) {
+      seen.add(value);
+      variants.push({ value, priority });
+    }
+  };
+  const base64 = base64EncodeUtf8(secret, false);
+  const base64Url = base64EncodeUtf8(secret, true);
+  add(secret, 0);
+  add(percentEncodeUtf8(secret, false), 1);
+  add(percentEncodeUtf8(secret, true), 2);
+  add(base64, 3);
+  add(base64.replace(/=+$/u, ''), 4);
+  add(base64Url, 5);
+  add(base64Url.replace(/=+$/u, ''), 6);
+  return variants;
+}
+
+function redactExtraSecrets(text, cfg) {
+  const patterns = [];
+  for (const secret of cfg.extraSecrets) patterns.push(...secretVariants(secret));
+  patterns.sort((a, b) => b.value.length - a.value.length || a.priority - b.priority);
+  let output = text;
+  for (const pattern of patterns) output = replaceExactAll(output, pattern.value, cfg.replacement);
+  return output;
+}
+
+function isPemLabelChar(code) {
+  return isAsciiAlphaNumeric(code) || code === 32;
+}
+
+function parsePemBegin(text, index) {
+  const prefix = '-----BEGIN ';
+  if (!startsWithAsciiAt(text, index, prefix)) return null;
+  let i = index + prefix.length;
+  const labelStart = i;
+  while (i < text.length && text.charCodeAt(i) !== 45 && text.charCodeAt(i) !== 10 && text.charCodeAt(i) !== 13 && i - labelStart <= 64) {
+    if (!isPemLabelChar(text.charCodeAt(i))) return null;
+    i += 1;
+  }
+  if (i - labelStart > 64 || !startsWithAsciiAt(text, i, '-----')) return null;
+  const label = text.slice(labelStart, i);
+  if (label.length === 0 || label.length > 64 || !label.endsWith('PRIVATE KEY')) return null;
+  return {
+    label,
+    end: i + 5,
+    endMarker: '-----END ' + label + '-----'
+  };
+}
+
+function redactPemBlocks(text, replacement) {
+  let output = '';
+  let index = 0;
+  let changed = false;
+  while (index < text.length) {
+    const begin = parsePemBegin(text, index);
+    if (!begin) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+    changed = true;
+    output += replacement;
+    let cursor = begin.end;
+    let consumedEnd = false;
+    while (cursor < text.length) {
+      if (startsWithAsciiAt(text, cursor, begin.endMarker)) {
+        cursor += begin.endMarker.length;
+        consumedEnd = true;
+        break;
+      }
+      cursor += 1;
+    }
+    index = cursor;
+    if (!consumedEnd) break;
+  }
+  return changed ? output + text.slice(index) : text;
+}
+
+function isSchemeChar(code) {
+  return isAsciiAlphaNumeric(code) || code === 43 || code === 45 || code === 46;
+}
+
+function isAuthorityTerminator(code) {
+  return code <= 0x20 || code === 0x7f || code === 47 || code === 63 || code === 35 ||
+    code === 34 || code === 39 || code === 60 || code === 62 || code === 92;
+}
+
+function redactUrlCredentials(text, replacement) {
+  let output = '';
+  let index = 0;
+  while (index < text.length) {
+    const code = text.charCodeAt(index);
+    if (!isAsciiAlpha(code)) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+
+    let schemeEnd = index + 1;
+    while (schemeEnd < text.length && schemeEnd - index <= 32 && isSchemeChar(text.charCodeAt(schemeEnd))) schemeEnd += 1;
+    if (!startsWithAsciiAt(text, schemeEnd, '://')) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+
+    const authorityStart = schemeEnd + 3;
+    let authorityEnd = authorityStart;
+    while (authorityEnd < text.length && !isAuthorityTerminator(text.charCodeAt(authorityEnd))) authorityEnd += 1;
+    let at = -1;
+    for (let i = authorityStart; i < authorityEnd; i += 1) {
+      if (text.charCodeAt(i) === 64) at = i;
+    }
+    if (at === -1) {
+      output += text.slice(index, authorityEnd);
+      index = authorityEnd;
+      continue;
+    }
+    output += text.slice(index, authorityStart) + replacement + text.slice(at, authorityEnd);
+    index = authorityEnd;
+  }
+  return output;
+}
+
+function isAsciiWordBoundaryBefore(text, index) {
+  if (index <= 0) return true;
+  const code = text.charCodeAt(index - 1);
+  return !isAsciiAlphaNumeric(code) && code !== 95;
+}
+
+function isBearerTokenChar(code) {
+  return isAsciiAlphaNumeric(code) || code === 45 || code === 46 || code === 95 || code === 126 ||
+    code === 43 || code === 47 || code === 61;
+}
+
+function looksLikeTokenShape(token) {
+  if (token.length < 8) return false;
+  if (token.length >= 24) return true;
+  let hasDigit = false;
+  let hasSymbol = false;
+  for (let i = 0; i < token.length; i += 1) {
+    const code = token.charCodeAt(i);
+    if (isAsciiDigit(code)) hasDigit = true;
+    else if (!isAsciiAlpha(code)) hasSymbol = true;
+  }
+  return hasDigit || hasSymbol;
+}
+
+function redactAuthSchemeTokens(text, replacement) {
+  let output = '';
+  let index = 0;
+  while (index < text.length) {
+    let schemeLength = 0;
+    if (startsWithAsciiCaseInsensitiveAt(text, index, 'bearer')) schemeLength = 6;
+    else if (startsWithAsciiCaseInsensitiveAt(text, index, 'basic')) schemeLength = 5;
+    if (schemeLength === 0 || !isAsciiWordBoundaryBefore(text, index)) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+    let cursor = index + schemeLength;
+    if (cursor >= text.length || (text.charCodeAt(cursor) !== 32 && text.charCodeAt(cursor) !== 9)) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+    while (cursor < text.length && (text.charCodeAt(cursor) === 32 || text.charCodeAt(cursor) === 9)) cursor += 1;
+    const tokenStart = cursor;
+    while (cursor < text.length && isBearerTokenChar(text.charCodeAt(cursor))) cursor += 1;
+    const token = text.slice(tokenStart, cursor);
+    if (!looksLikeTokenShape(token)) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+    output += text.slice(index, tokenStart) + replacement;
+    index = cursor;
+  }
+  return output;
+}
+
+function matchCookieHeaderName(text, index) {
+  if (startsWithAsciiCaseInsensitiveAt(text, index, 'set-cookie')) return 'set-cookie'.length;
+  if (startsWithAsciiCaseInsensitiveAt(text, index, 'cookie')) return 'cookie'.length;
+  return 0;
+}
+
+function redactCookieHeaders(text, replacement) {
+  let output = '';
+  let index = 0;
+  while (index < text.length) {
+    const nameLength = matchCookieHeaderName(text, index);
+    if (nameLength === 0 || !isAsciiWordBoundaryBefore(text, index)) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+    let cursor = index + nameLength;
+    if (isAsciiAlphaNumeric(text.charCodeAt(cursor)) || text.charCodeAt(cursor) === 95) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+    while (cursor < text.length && (text.charCodeAt(cursor) === 32 || text.charCodeAt(cursor) === 9)) cursor += 1;
+    if (text.charCodeAt(cursor) !== 58) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+    cursor += 1;
+    while (cursor < text.length && (text.charCodeAt(cursor) === 32 || text.charCodeAt(cursor) === 9)) cursor += 1;
+    let valueEnd = cursor;
+    while (valueEnd < text.length && text.charCodeAt(valueEnd) !== 10 && text.charCodeAt(valueEnd) !== 13) valueEnd += 1;
+    output += text.slice(index, cursor) + replacement;
+    index = valueEnd;
+  }
+  return output;
+}
+
+function matchGenericSecretKey(text, index) {
+  for (const canonical of GENERIC_SECRET_KEYS) {
+    let ti = index;
+    let ki = 0;
+    while (ki < canonical.length) {
+      while (ti < text.length && (text.charCodeAt(ti) === 95 || text.charCodeAt(ti) === 45)) ti += 1;
+      if (ti >= text.length) break;
+      if (asciiLower(text[ti]) !== canonical[ki]) break;
+      ti += 1;
+      ki += 1;
+    }
+    if (ki === canonical.length) {
+      const next = text.charCodeAt(ti);
+      if (ti < text.length && isAsciiAlphaNumeric(next)) continue;
+      return { end: ti, canonical };
+    }
+  }
+  return null;
+}
+
+function redactGenericKeyValues(text, replacement) {
+  let output = '';
+  let index = 0;
+  while (index < text.length) {
+    const keyMatch = matchGenericSecretKey(text, index);
+    if (!keyMatch || !isAsciiWordBoundaryBefore(text, index)) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+    let cursor = keyMatch.end;
+    if (text.charCodeAt(cursor) === 34 || text.charCodeAt(cursor) === 39) cursor += 1;
+    while (cursor < text.length && (text.charCodeAt(cursor) === 32 || text.charCodeAt(cursor) === 9)) cursor += 1;
+    if (text.charCodeAt(cursor) !== 58 && text.charCodeAt(cursor) !== 61) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+    cursor += 1;
+    while (cursor < text.length && (text.charCodeAt(cursor) === 32 || text.charCodeAt(cursor) === 9)) cursor += 1;
+
+    const quote = text.charCodeAt(cursor);
+    if (quote === 34 || quote === 39) {
+      const valueStart = cursor + 1;
+      let valueEnd = valueStart;
+      let closed = false;
+      while (valueEnd < text.length) {
+        const code = text.charCodeAt(valueEnd);
+        if (code === 92) {
+          valueEnd += 2;
+          continue;
+        }
+        if (code === quote) {
+          closed = true;
+          break;
+        }
+        if (code === 10 || code === 13) break;
+        valueEnd += 1;
+      }
+      const valueLength = valueEnd - valueStart;
+      if (valueLength >= 4) {
+        output += text.slice(index, valueStart) + replacement;
+        if (closed) output += text[valueEnd];
+        index = closed ? valueEnd + 1 : valueEnd;
+      } else {
+        output += text.slice(index, cursor + 1);
+        index = cursor + 1;
+      }
+      continue;
+    }
+
+    const valueStart = cursor;
+    let valueEnd = valueStart;
+    while (valueEnd < text.length) {
+      const code = text.charCodeAt(valueEnd);
+      if (code <= 32 || code === 44 || code === 59 || code === 38 || code === 34 || code === 39) break;
+      valueEnd += 1;
+    }
+    if (valueEnd - valueStart >= 4) {
+      output += text.slice(index, valueStart) + replacement;
+      index = valueEnd;
+    } else {
+      output += text[index];
+      index += 1;
+    }
+  }
+  return output;
+}
+
+const JWT_RE = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])/g;
+
+const VENDOR_TOKEN_PATTERNS = Object.freeze([
+  /(?<![A-Z0-9])(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{16}(?![A-Z0-9])/g,
+  /(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{20,80}|github_pat_[A-Za-z0-9_]{20,120})(?![A-Za-z0-9_])/g,
+  /(?<![A-Za-z0-9_])(?:[sr]k_(?:live|test)_[A-Za-z0-9]{12,120}|whsec_[A-Za-z0-9]{12,120})(?![A-Za-z0-9_])/g,
+  /(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,120}(?![A-Za-z0-9])/g,
+  /(?<![A-Za-z0-9])xapp-[A-Za-z0-9-]{10,120}(?![A-Za-z0-9])/g,
+  /(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,160}(?![A-Za-z0-9_-])/g,
+  /(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{20,160}(?![A-Za-z0-9_-])/g,
+  /(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{30,80}(?![A-Za-z0-9_])/g,
+  /(?<![A-Za-z0-9_-])pypi-[A-Za-z0-9_-]{20,160}(?![A-Za-z0-9_-])/g,
+  /(?<![A-Za-z0-9_-])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g
+]);
+
+function redactVendorTokens(text, replacement) {
+  let output = text;
+  output = output.replace(JWT_RE, replacement);
+  for (const pattern of VENDOR_TOKEN_PATTERNS) output = output.replace(pattern, replacement);
+  return output;
+}
+
+const EMAIL_RE = /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}(?![A-Za-z0-9._%+-])/g;
+const SSN_RE = /(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)/g;
+const IPV4_RE = /(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])/g;
+
+function validSsn(value) {
+  const area = Number(value.slice(0, 3));
+  const group = Number(value.slice(4, 6));
+  const serial = Number(value.slice(7, 11));
+  return area !== 0 && area !== 666 && area < 900 && group !== 0 && serial !== 0;
+}
+
+function validIpv4(value) {
+  const parts = value.split('.');
+  if (parts.length !== 4) return false;
+  for (const part of parts) {
+    if (part.length === 0 || part.length > 3 || !/^\d+$/u.test(part)) return false;
+    if (Number(part) > 255) return false;
+  }
+  return true;
+}
+
+function luhnValid(digits) {
+  let sum = 0;
+  let doubleDigit = false;
+  for (let i = digits.length - 1; i >= 0; i -= 1) {
+    let value = digits.charCodeAt(i) - 48;
+    if (doubleDigit) {
+      value *= 2;
+      if (value > 9) value -= 9;
+    }
+    sum += value;
+    doubleDigit = !doubleDigit;
+  }
+  return sum % 10 === 0;
+}
+
+function redactLuhnCards(text, replacement) {
+  let output = '';
+  let index = 0;
+  while (index < text.length) {
+    if (!isAsciiDigit(text.charCodeAt(index)) || (index > 0 && isAsciiAlphaNumeric(text.charCodeAt(index - 1)))) {
+      output += text[index];
+      index += 1;
+      continue;
+    }
+    let cursor = index;
+    let digits = '';
+    let end = index;
+    while (cursor < text.length) {
+      const code = text.charCodeAt(cursor);
+      if (isAsciiDigit(code)) {
+        digits += text[cursor];
+        cursor += 1;
+        end = cursor;
+        continue;
+      }
+      if ((code === 32 || code === 45) && cursor + 1 < text.length && isAsciiDigit(text.charCodeAt(cursor + 1)) && digits.length > 0) {
+        cursor += 1;
+        continue;
+      }
+      break;
+    }
+    const after = text.charCodeAt(end);
+    if (digits.length >= 13 && digits.length <= 19 && luhnValid(digits) && (end >= text.length || !isAsciiAlphaNumeric(after))) {
+      output += replacement;
+    } else {
+      output += text.slice(index, end);
+    }
+    index = end;
+  }
+  return output;
+}
+
+function applyOptionalPii(text, cfg) {
+  let output = text;
+  if (cfg.pii.luhnCard) output = redactLuhnCards(output, cfg.replacement);
+  if (cfg.pii.ssn) {
+    output = output.replace(SSN_RE, (match) => validSsn(match) ? cfg.replacement : match);
+  }
+  if (cfg.pii.ipv4) {
+    output = output.replace(IPV4_RE, (match) => validIpv4(match) ? cfg.replacement : match);
+  }
+  if (cfg.pii.email) output = output.replace(EMAIL_RE, cfg.replacement);
+  return output;
+}
+
+function redactSecretsCore(text, cfg) {
+  let output = text;
+  output = redactPemBlocks(output, cfg.replacement);
+  output = redactUrlCredentials(output, cfg.replacement);
+  output = redactAuthSchemeTokens(output, cfg.replacement);
+  output = redactCookieHeaders(output, cfg.replacement);
+  output = redactGenericKeyValues(output, cfg.replacement);
+  output = redactVendorTokens(output, cfg.replacement);
+  output = redactExtraSecrets(output, cfg);
+  output = applyOptionalPii(output, cfg);
+  return output;
+}
+
+export function redactSecrets(text, options) {
+  assertStringInput(text, 'text');
+  const cfg = normalizeOptions(options, REDACT_OPTION_KEYS);
+  return redactSecretsCore(text, cfg);
+}
+
+function sanitizeAndRedactString(text, cfg) {
+  const initiallyRedacted = redactSecretsCore(text, cfg);
+  const canonical = sanitizeLineCore(initiallyRedacted, cfg);
+  return redactSecretsCore(canonical, cfg);
+}
+
+function normalizeObjectPathSegment(key) {
+  return normalizeKeyName(key);
+}
+
+function pathIsRedacted(path, cfg) {
+  for (const redactPath of cfg.redactPaths) {
+    if (redactPath.length !== path.length) continue;
+    let same = true;
+    for (let i = 0; i < path.length; i += 1) {
+      if (redactPath[i] !== path[i]) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return true;
+  }
+  return false;
+}
+
+function isDangerousObjectKey(key) {
+  return RESERVED_OBJECT_KEYS.has(key.toLowerCase());
+}
+
+function symbolDescription(symbol) {
+  const description = symbol.description;
+  return description === undefined ? 'Symbol()' : 'Symbol(' + description + ')';
+}
+
+function consumeNode(state) {
+  state.nodes += 1;
+  return state.nodes <= state.maxNodes;
+}
+
+function objectTag(value) {
+  try {
+    return Object.prototype.toString.call(value);
+  } catch {
+    return '';
+  }
+}
+
+function setOutputKey(output, key, value) {
+  let candidate = key;
+  if (Object.prototype.hasOwnProperty.call(output, candidate)) {
+    let counter = 2;
+    while (Object.prototype.hasOwnProperty.call(output, candidate + ' [duplicate ' + counter + ']')) counter += 1;
+    candidate = candidate + ' [duplicate ' + counter + ']';
+  }
+  Object.defineProperty(output, candidate, {
+    value,
+    enumerable: true,
+    configurable: false,
+    writable: false
+  });
+}
+
+function sanitizeObjectKey(key, cfg) {
+  return sanitizeAndRedactString(key, cfg);
+}
+
+function readOwnEnumerableKeys(value) {
+  const keys = [];
+  for (const key of Object.keys(value)) keys.push(key);
+  for (const symbol of Object.getOwnPropertySymbols(value)) {
+    try {
+      if (Object.prototype.propertyIsEnumerable.call(value, symbol)) keys.push(symbol);
+    } catch {
+      // Ignore an unreadable symbol key. It is not copied.
+    }
+  }
+  return keys;
+}
+
+function sanitizeErrorValue(value, depth, path, state, cfg) {
+  const output = Object.create(null);
+  const name = typeof value.name === 'string' ? value.name : 'Error';
+  const message = typeof value.message === 'string' ? value.message : '';
+  setOutputKey(output, 'name', sanitizeAndRedactString(name, cfg));
+  setOutputKey(output, 'message', sanitizeAndRedactString(message, cfg));
+  try {
+    if ('code' in value && value.code !== undefined) {
+      setOutputKey(output, 'code', sanitizeValue(value.code, depth + 1, path.concat('code'), state, cfg));
+    }
+  } catch {
+    setOutputKey(output, 'code', '[Unreadable]');
+  }
+  try {
+    if (typeof value.stack === 'string' && value.stack.length > 0) {
+      setOutputKey(output, 'stack', sanitizeAndRedactString(value.stack, cfg));
+    }
+  } catch {
+    setOutputKey(output, 'stack', '[Unreadable]');
+  }
+  try {
+    if ('cause' in value) {
+      setOutputKey(output, 'cause', sanitizeValue(value.cause, depth + 1, path.concat('cause'), state, cfg));
+    }
+  } catch {
+    setOutputKey(output, 'cause', '[Unreadable]');
+  }
+  return output;
+}
+
+function sanitizeArrayValue(value, depth, path, state, cfg) {
+  const output = [];
+  const count = Math.min(value.length, cfg.maxArrayLength);
+  for (let i = 0; i < count; i += 1) {
+    if (!consumeNode(state)) {
+      output.push('[Truncated]');
+      continue;
+    }
+    output.push(sanitizeValue(value[i], depth + 1, path.concat(String(i)), state, cfg));
+  }
+  if (value.length > cfg.maxArrayLength) output.push('[Truncated]');
+  return output;
+}
+
+function sanitizeTypedArrayValue(value, depth, path, state, cfg) {
+  const output = [];
+  const count = Math.min(value.length, cfg.maxArrayLength);
+  for (let i = 0; i < count; i += 1) {
+    if (!consumeNode(state)) {
+      output.push('[Truncated]');
+      continue;
+    }
+    output.push(sanitizeValue(value[i], depth + 1, path.concat(String(i)), state, cfg));
+  }
+  if (value.length > cfg.maxArrayLength) output.push('[Truncated]');
+  return output;
+}
+
+function sanitizeMapValue(value, depth, path, state, cfg) {
+  const output = [];
+  let count = 0;
+  for (const entry of value.entries()) {
+    if (count >= cfg.maxArrayLength) break;
+    count += 1;
+    if (!consumeNode(state)) {
+      output.push('[Truncated]');
+      continue;
+    }
+    const safeEntryKey = sanitizeValue(entry[0], depth + 1, path.concat('key'), state, cfg);
+    let keySensitive = false;
+    if (typeof entry[0] === 'string') {
+      const rawSegment = normalizeObjectPathSegment(entry[0]);
+      const safeSegment = typeof safeEntryKey === 'string' ? normalizeObjectPathSegment(safeEntryKey) : '';
+      keySensitive = cfg.sensitiveKeys.has(rawSegment) || cfg.sensitiveKeys.has(safeSegment);
+    }
+    output.push([
+      safeEntryKey,
+      keySensitive ? cfg.replacement : sanitizeValue(entry[1], depth + 1, path.concat('value'), state, cfg)
+    ]);
+  }
+  if (value.size > cfg.maxArrayLength) output.push('[Truncated]');
+  return output;
+}
+
+function sanitizeSetValue(value, depth, path, state, cfg) {
+  const output = [];
+  let count = 0;
+  for (const entry of value.values()) {
+    if (count >= cfg.maxArrayLength) break;
+    count += 1;
+    if (!consumeNode(state)) {
+      output.push('[Truncated]');
+      continue;
+    }
+    output.push(sanitizeValue(entry, depth + 1, path.concat(String(count - 1)), state, cfg));
+  }
+  if (value.size > cfg.maxArrayLength) output.push('[Truncated]');
+  return output;
+}
+
+function sanitizePlainObjectValue(value, depth, path, state, cfg) {
+  const output = Object.create(null);
+  const keys = readOwnEnumerableKeys(value);
+  const count = Math.min(keys.length, cfg.maxKeys);
+  for (let position = 0; position < count; position += 1) {
+    const rawKey = keys[position];
+    const keyText = typeof rawKey === 'symbol' ? symbolDescription(rawKey) : rawKey;
+    if (isDangerousObjectKey(keyText)) continue;
+    const safeKey = sanitizeObjectKey(keyText, cfg);
+    if (isDangerousObjectKey(safeKey)) continue;
+
+    const rawSegment = normalizeObjectPathSegment(keyText);
+    const safeSegment = normalizeObjectPathSegment(safeKey);
+    const childPath = path.concat(safeSegment);
+    const rawChildPath = path.concat(rawSegment);
+    const sensitive = cfg.sensitiveKeys.has(rawSegment) || cfg.sensitiveKeys.has(safeSegment) ||
+      pathIsRedacted(childPath, cfg) || pathIsRedacted(rawChildPath, cfg);
+    let child;
+    if (sensitive) {
+      child = cfg.replacement;
+    } else {
+      if (!consumeNode(state)) {
+        child = '[Truncated]';
+      } else {
+        try {
+          child = sanitizeValue(value[rawKey], depth + 1, childPath, state, cfg);
+        } catch {
+          child = '[Unreadable]';
+        }
+      }
+    }
+    setOutputKey(output, safeKey, child);
+  }
+  if (keys.length > cfg.maxKeys) setOutputKey(output, '[truncated]', String(keys.length - cfg.maxKeys) + ' more');
+  return output;
+}
+
+function sanitizeContainer(value, depth, path, state, cfg) {
+  if (depth > cfg.maxDepth) return '[MaxDepth]';
+  if (state.stack.has(value)) return '[Circular]';
+  if (!consumeNode(state)) return '[Truncated]';
+  state.stack.add(value);
+  try {
+    const tag = objectTag(value);
+    if (value instanceof Error || tag === '[object Error]' || tag === '[object DOMException]') {
+      return sanitizeErrorValue(value, depth, path, state, cfg);
+    }
+    if (value instanceof Date || tag === '[object Date]') {
+      try {
+        const time = value.getTime();
+        return Number.isFinite(time) ? value.toISOString() : '[Invalid Date]';
+      } catch {
+        return '[Invalid Date]';
+      }
+    }
+    if (typeof URL !== 'undefined' && value instanceof URL) {
+      try {
+        return sanitizeAndRedactString(value.href, cfg);
+      } catch {
+        return '[Unreadable URL]';
+      }
+    }
+    if (Array.isArray(value)) return sanitizeArrayValue(value, depth, path, state, cfg);
+    if (value instanceof Map || tag === '[object Map]') return sanitizeMapValue(value, depth, path, state, cfg);
+    if (value instanceof Set || tag === '[object Set]') return sanitizeSetValue(value, depth, path, state, cfg);
+    if (ArrayBuffer.isView(value)) {
+      if (value instanceof DataView || tag === '[object DataView]') return '[DataView]';
+      return sanitizeTypedArrayValue(value, depth, path, state, cfg);
+    }
+    return sanitizePlainObjectValue(value, depth, path, state, cfg);
+  } catch {
+    return '[Unreadable]';
+  } finally {
+    state.stack.delete(value);
+  }
+}
+
+function sanitizeValue(value, depth, path, state, cfg) {
+  if (value === null) return null;
+  const type = typeof value;
+  if (type === 'string') return sanitizeAndRedactString(value, cfg);
+  if (type === 'number') return Number.isFinite(value) ? value : String(value);
+  if (type === 'boolean') return value;
+  if (type === 'undefined') return null;
+  if (type === 'bigint') return value.toString() + 'n';
+  if (type === 'symbol') return sanitizeAndRedactString(symbolDescription(value), cfg);
+  if (type === 'function') {
+    const name = typeof value.name === 'string' && value.name.length > 0 ? ' ' + value.name : '';
+    return sanitizeAndRedactString('[Function' + name + ']', cfg);
+  }
+  if (type === 'object') return sanitizeContainer(value, depth, path, state, cfg);
+  return '[Unsupported]';
+}
+
+function sanitizeRecordCore(record, cfg) {
+  const state = { nodes: 0, maxNodes: cfg.maxNodes, stack: new Set() };
+  return sanitizeValue(record, 0, [], state, cfg);
+}
+
+export function sanitizeLogRecord(record, options) {
+  const cfg = normalizeOptions(options, RECORD_OPTION_KEYS);
+  return sanitizeRecordCore(record, cfg);
+}
+
+function utf8Length(text) {
+  let length = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const first = text.charCodeAt(i);
+    if (isHighSurrogate(first) && i + 1 < text.length && isLowSurrogate(text.charCodeAt(i + 1))) {
+      length += 4;
+      i += 1;
+    } else if (first < 0x80) {
+      length += 1;
+    } else if (first < 0x800) {
+      length += 2;
+    } else {
+      length += 3;
+    }
+  }
+  return length;
+}
+
+function timestampString(value) {
+  if (value === undefined) return new Date().toISOString();
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number') return new Date(value).toISOString();
+  return value.toISOString();
+}
+
+function containsLineBreak(text) {
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code === 10 || code === 13 || code === 0x85 || code === 0x2028 || code === 0x2029) return true;
+  }
+  return false;
+}
+
+function formatJsonCore(level, message, meta, hasMeta, cfg) {
+  assertStringInput(level, 'level');
+  assertStringInput(message, 'message');
+  const safeLevel = sanitizeAndRedactString(level, cfg);
+  if (safeLevel.length === 0) invalidInput('level must not sanitize to an empty string');
+  const safeMessage = sanitizeAndRedactString(message, cfg);
+  const timestampCfg = cfg.maxLength >= 128 ? cfg : Object.freeze({ ...cfg, maxLength: 128 });
+  const safeTimestamp = sanitizeAndRedactString(timestampString(cfg.timestamp), timestampCfg);
+  if (safeTimestamp.length === 0) invalidOptions('timestamp must not sanitize to an empty string', 'timestamp');
+
+  const entry = Object.create(null);
+  entry.ts = safeTimestamp;
+  entry.level = safeLevel;
+  entry.msg = safeMessage;
+  if (hasMeta) entry.meta = sanitizeRecordCore(meta, cfg);
+
+  const output = JSON.stringify(entry);
+  const bytes = utf8Length(output);
+  if (bytes > cfg.maxOutputBytes) {
+    fail(CODE.LIMIT_EXCEEDED, 'serialized log entry exceeds maxOutputBytes', { limit: cfg.maxOutputBytes, actual: bytes });
+  }
+  if (containsLineBreak(output)) {
+    fail(CODE.OUTPUT_INVARIANT, 'serialized log entry contains a line break');
+  }
+  return output;
+}
+
+export function formatSafeJsonLog(level, message, meta, options) {
+  const hasMeta = arguments.length >= 3;
+  const cfg = normalizeOptions(options, JSON_OPTION_KEYS);
+  return formatJsonCore(level, message, meta, hasMeta, cfg);
+}
+
+function mergeAndNormalize(baseOptions, overrides, allowedKeys) {
+  if (overrides === undefined) return normalizeOptions(baseOptions, ALL_OPTION_KEYS);
+  const input = optionsObject(overrides, 'overrides');
+  assertKnownKeys(input, allowedKeys);
+  return normalizeOptions({ ...baseOptions, ...input }, ALL_OPTION_KEYS);
+}
+
+function sanitizeConsoleArgument(value, cfg) {
+  if (typeof value === 'string') return sanitizeAndRedactString(value, cfg);
+  if (value === null || typeof value === 'number' || typeof value === 'boolean' || typeof value === 'undefined') return value;
+  return sanitizeRecordCore(value, cfg);
+}
+
+function wrapConsoleWithConfig(target, baseOptions, baseCfg) {
+  const consoleTarget = target === undefined ? globalThis.console : target;
+  if (!isObjectLike(consoleTarget)) invalidInput('console target must be an object');
+  const fallback = consoleTarget.log;
+  if (typeof fallback !== 'function') invalidInput('console target must provide a log function');
+  const wrapped = {};
+  for (const method of CONSOLE_METHODS) {
+    const fn = typeof consoleTarget[method] === 'function' ? consoleTarget[method] : fallback;
+    wrapped[method] = (...args) => {
+      const cfg = baseCfg;
+      fn.call(consoleTarget, ...args.map((value) => sanitizeConsoleArgument(value, cfg)));
+    };
+  }
+  return Object.freeze(wrapped);
+}
+
+function cloneOptionInput(input) {
+  const output = { ...input };
+  if (Array.isArray(input.extraSecrets)) output.extraSecrets = Object.freeze([...input.extraSecrets]);
+  if (Array.isArray(input.sensitiveKeys)) output.sensitiveKeys = Object.freeze([...input.sensitiveKeys]);
+  if (Array.isArray(input.redactPaths)) {
+    output.redactPaths = Object.freeze(input.redactPaths.map((entry) => Array.isArray(entry) ? Object.freeze([...entry]) : entry));
+  }
+  if (input.pii !== undefined && isObjectLike(input.pii) && !Array.isArray(input.pii)) output.pii = Object.freeze({ ...input.pii });
+  return Object.freeze(output);
+}
+
+export function createLogCage(options) {
+  const inputOptions = optionsObject(options, 'options');
+  assertKnownKeys(inputOptions, ALL_OPTION_KEYS);
+  const baseOptions = cloneOptionInput(inputOptions);
+  const baseCfg = normalizeOptions(baseOptions, ALL_OPTION_KEYS);
+
+  const guard = {
+    line(input, overrides) {
+      assertStringInput(input, 'input');
+      const cfg = overrides === undefined ? baseCfg : mergeAndNormalize(baseOptions, overrides, LINE_OPTION_KEYS);
+      return sanitizeLineCore(input, cfg);
+    },
+    redact(text, overrides) {
+      assertStringInput(text, 'text');
+      const cfg = overrides === undefined ? baseCfg : mergeAndNormalize(baseOptions, overrides, REDACT_OPTION_KEYS);
+      return redactSecretsCore(text, cfg);
+    },
+    record(record, overrides) {
+      const cfg = overrides === undefined ? baseCfg : mergeAndNormalize(baseOptions, overrides, RECORD_OPTION_KEYS);
+      return sanitizeRecordCore(record, cfg);
+    },
+    json(level, message, meta, overrides) {
+      const hasMeta = arguments.length >= 3;
+      const cfg = overrides === undefined ? baseCfg : mergeAndNormalize(baseOptions, overrides, JSON_OPTION_KEYS);
+      return formatJsonCore(level, message, meta, hasMeta, cfg);
+    },
+    wrapConsole(target) {
+      return wrapConsoleWithConfig(target, baseOptions, baseCfg);
+    }
+  };
+  return Object.freeze(guard);
+}
+
+const logcage = Object.freeze({
+  CODE,
+  LogCageError,
+  sanitizeLogLine,
+  redactSecrets,
+  sanitizeLogRecord,
+  formatSafeJsonLog,
+  createLogCage
+});
+
+export default logcage;
