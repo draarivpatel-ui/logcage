@@ -9,18 +9,24 @@
 
 ## Reporting a vulnerability
 
-Please report security issues privately using GitHub's "Report a vulnerability" feature on the repository's Security tab. Do not open a public issue for an exploitable finding.
+Do not open a public issue for a suspected vulnerability. [Report a vulnerability privately through GitHub](https://github.com/draarivpatel-ui/logcage/security/advisories/new).
 
-Include:
+Please include:
 
-- A minimal proof of concept using synthetic secrets and synthetic personal data only.
-- The affected version and Node.js version.
+- A minimal reproduction that uses synthetic input only.
+- The affected project version, commit or action ref, and Node.js version.
 - The expected security boundary and the observed violation.
-- Whether the issue permits log forging, terminal escape injection, secret disclosure, prototype pollution, output-size bypass or a documented limit bypass.
+- Logs, output, or proof-of-concept code needed to reproduce the finding, with real secrets removed.
 
-Never include a real token, cookie, password, private key, production log line or real personal data in a report. Use synthetic shaped values that reproduce the behavior.
+Never include a real token, cookie, password, private key, production log line or real personal data in a report.
 
-You should receive an acknowledgement within 7 days. We will work with you on a fix and coordinate disclosure. Please give maintainers a reasonable window to release a patch before public disclosure.
+Vulnerability handling steps:
+
+1. The maintainer acknowledges the private report within 72 hours.
+2. The maintainer reproduces the finding against the latest supported version and confirms severity within 14 days when enough information is available.
+3. A fix is developed privately, with regression coverage where practical.
+4. The maintainer coordinates the advisory, affected versions, reporter credit and disclosure date with the reporter.
+5. The target coordinated disclosure window is 90 days or less from acknowledgment. If more time is needed, the maintainer and reporter agree on a new date before disclosure.
 
 ## Scope
 
