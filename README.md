@@ -6,7 +6,7 @@ Zero-dependency CWE-117 log injection, terminal escape sanitization and automati
 
 `logcage` is a small, auditable security library for applications that write untrusted values into text logs. It neutralizes line breaks, terminal control sequences, bidirectional overrides, invisible format characters and lone surrogates; redacts common credential shapes and caller-supplied secrets; sanitizes structured records without mutating them; and emits single-line NDJSON entries that cannot be split into multiple log lines by input-controlled characters. It works in ESM and CommonJS with strict TypeScript declarations and no runtime dependencies.
 
-- **Zero dependencies.** No runtime or development dependencies and no install scripts.
+- **Zero runtime dependencies.** Library code has no third-party runtime dependencies and no install scripts; fuzz tooling is development-only.
 - **Dual module.** Native ESM (`import`) and CommonJS (`require`) entry points generated from one source of truth.
 - **Fail closed.** Non-string input to string APIs, invalid options, unknown option keys and oversized NDJSON output throw `LogCageError`.
 - **Linear scanning.** The terminal and control-character sanitizer is a character-code state machine, not a backtracking regex parser.

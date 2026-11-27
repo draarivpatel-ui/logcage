@@ -1,6 +1,6 @@
 # Contributing to logcage
 
-Thanks for helping make application logs safer. This project is deliberately small and dependency free, so contributions are reviewed with an emphasis on correctness, clarity and auditability.
+Thanks for helping make application logs safer. This project is deliberately small and free of runtime dependencies, so contributions are reviewed with an emphasis on correctness, clarity and auditability.
 
 ## Ground rules
 
@@ -13,11 +13,13 @@ Thanks for helping make application logs safer. This project is deliberately sma
 
 ## Development setup
 
-No install step is required. The package has no dependencies.
+No install step is required for the core suite. Run `npm ci` once before the fast-check fuzz suite.
 
 ```sh
 node --version        # 18 or newer
 npm test              # node --test tests/*.test.mjs
+npm ci
+npm run test:fuzz
 node scripts/build-cjs.mjs --check
 npm pack --dry-run
 ```

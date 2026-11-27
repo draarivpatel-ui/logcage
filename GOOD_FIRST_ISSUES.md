@@ -40,7 +40,7 @@ Acceptance checklist:
 
 - Exercise every public function and option surface.
 - Prove `LogCage` method overloads and `WrappedConsole` are typed.
-- `dependencies` and `devDependencies` in package.json remain empty.
+- `dependencies` in package.json remains empty and any compile tooling stays development-only.
 
 ## 5. Redaction precedence documentation
 

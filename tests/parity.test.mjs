@@ -143,12 +143,15 @@ test('TypeScript declarations include security-critical option documentation', (
   }
 });
 
-test('package manifest is zero dependency and points at the public repository', () => {
+test('package manifest has zero runtime dependencies and points at the public repository', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   assert.equal(pkg.name, 'logcage');
   assert.equal(pkg.version, '1.0.0');
   assert.deepEqual(pkg.dependencies, {});
-  assert.deepEqual(pkg.devDependencies, {});
+  assert.ok(Object.keys(pkg.devDependencies || {}).includes('fast-check'));
+  for (const name of Object.keys(pkg.devDependencies || {})) {
+    assert.equal(pkg.dependencies[name], undefined, `${name} must stay development-only`);
+  }
   assert.equal(pkg.repository.url, 'git+https://github.com/draarivpatel-ui/logcage.git');
   assert.equal(pkg.homepage, 'https://github.com/draarivpatel-ui/logcage#readme');
   assert.equal(pkg.bugs.url, 'https://github.com/draarivpatel-ui/logcage/issues');
