@@ -51,7 +51,7 @@ The following are generally out of scope:
 
 - Terminal-control parsing is a character-code state machine rather than a backtracking regex parser.
 - ANSI string controls are removed atomically, including unterminated sequences through end of input.
-- Record strings are redacted before and after canonical line sanitization so both direct and terminal-control-obfuscated secrets are covered within documented limits.
+- Record strings are redacted before and after canonical line sanitization, then truncated only after the final redaction pass, so direct and terminal-control-obfuscated secrets are covered without exposing a truncation-boundary prefix.
 - Sensitive record values are redacted before their properties are read.
 - Output objects are created with a null prototype and dangerous keys are omitted.
 - Errors use fixed reason strings and never echo untrusted input or secret values.

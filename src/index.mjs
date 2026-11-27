@@ -476,8 +476,52 @@ function createTruncatingAppender(maxLength, marker) {
   };
 }
 
-function sanitizeLineCore(input, cfg) {
+function isAsciiHexDigit(code) {
+  return isAsciiDigit(code) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102);
+}
+
+function canonicalEscapeTokenWidth(text, index) {
+  if (text.charCodeAt(index) !== 92) return 0;
+  const second = text.charCodeAt(index + 1);
+  if (second === 110 || second === 114 || second === 116) return 2;
+  if (second === 120 && isAsciiHexDigit(text.charCodeAt(index + 2)) && isAsciiHexDigit(text.charCodeAt(index + 3))) return 4;
+  if (second !== 117) return 0;
+  if (text.charCodeAt(index + 2) === 123) {
+    let cursor = index + 3;
+    let digits = 0;
+    while (digits <= 6 && isAsciiHexDigit(text.charCodeAt(cursor))) {
+      cursor += 1;
+      digits += 1;
+    }
+    if (digits > 0 && digits <= 6 && text.charCodeAt(cursor) === 125) return cursor - index + 1;
+    return 0;
+  }
+  let width = 2;
+  while (width < 6 && isAsciiHexDigit(text.charCodeAt(index + width))) width += 1;
+  return width === 6 ? 6 : 0;
+}
+
+function canonicalTokenWidth(text, index) {
+  const escapeWidth = canonicalEscapeTokenWidth(text, index);
+  if (escapeWidth !== 0) return escapeWidth;
+  const first = text.charCodeAt(index);
+  if (isHighSurrogate(first) && index + 1 < text.length && isLowSurrogate(text.charCodeAt(index + 1))) return 2;
+  return 1;
+}
+
+function truncateCanonicalText(text, cfg) {
   const output = createTruncatingAppender(cfg.maxLength, cfg.truncationMarker);
+  let index = 0;
+  while (index < text.length) {
+    const width = canonicalTokenWidth(text, index);
+    output.append(text.slice(index, index + width));
+    index += width;
+  }
+  return output.finish();
+}
+
+function canonicalizeLine(input, cfg) {
+  const chunks = [];
   let i = 0;
   while (i < input.length) {
     const first = input.charCodeAt(i);
@@ -507,13 +551,17 @@ function sanitizeLineCore(input, cfg) {
     }
 
     if (loneSurrogate || isUnsafeControlOrFormat(cp)) {
-      output.append(cfg.mode === 'escape' ? escapeForCodePoint(cp) : '');
+      if (cfg.mode === 'escape') chunks.push(escapeForCodePoint(cp));
     } else {
-      output.append(input.slice(i, i + width));
+      chunks.push(input.slice(i, i + width));
     }
     i += width;
   }
-  return output.finish();
+  return chunks.join('');
+}
+
+function sanitizeLineCore(input, cfg) {
+  return truncateCanonicalText(canonicalizeLine(input, cfg), cfg);
 }
 
 export function sanitizeLogLine(input, options) {
@@ -545,19 +593,15 @@ function utf8Bytes(text) {
 }
 
 function isUriUnreservedByte(byte) {
-  return isAsciiAlphaNumeric(byte) || byte === 45 || byte === 95 || byte === 46 || byte === 33 ||
-    byte === 126 || byte === 42 || byte === 39 || byte === 40 || byte === 41;
+  return isAsciiAlphaNumeric(byte) || byte === 45 || byte === 95 || byte === 46 || byte === 126;
 }
 
-function percentEncodeUtf8(text, uppercase) {
+function percentEncodeUtf8(text) {
   const bytes = utf8Bytes(text);
   let output = '';
   for (const byte of bytes) {
     if (isUriUnreservedByte(byte)) output += String.fromCharCode(byte);
-    else {
-      const hex = byte.toString(16).padStart(2, '0');
-      output += '%' + (uppercase ? hex.toUpperCase() : hex.toLowerCase());
-    }
+    else output += '%' + byte.toString(16).padStart(2, '0');
   }
   return output;
 }
@@ -582,13 +626,32 @@ function base64EncodeUtf8(text, urlSafe) {
   return output;
 }
 
-function replaceExactAll(text, search, replacement) {
+function formPercentEncodeUtf8(text) {
+  return percentEncodeUtf8(text).replace(/%20/g, '+');
+}
+
+function canonicalizePercentHexCase(text) {
+  if (!text.includes('%')) return text;
+  const chunks = [];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 37 && isAsciiHexDigit(text.charCodeAt(i + 1)) && isAsciiHexDigit(text.charCodeAt(i + 2))) {
+      chunks.push('%', asciiLower(text[i + 1]), asciiLower(text[i + 2]));
+      i += 2;
+    } else {
+      chunks.push(text[i]);
+    }
+  }
+  return chunks.join('');
+}
+
+function replaceExactAll(text, search, replacement, percentEncoded) {
   if (search.length === 0 || text.length === 0) return text;
+  const haystack = percentEncoded ? canonicalizePercentHexCase(text) : text;
   let index = 0;
   let output = '';
   let found = false;
   while (index <= text.length) {
-    const at = text.indexOf(search, index);
+    const at = haystack.indexOf(search, index);
     if (at === -1) break;
     found = true;
     output += text.slice(index, at) + replacement;
@@ -601,21 +664,21 @@ function replaceExactAll(text, search, replacement) {
 function secretVariants(secret) {
   const variants = [];
   const seen = new Set();
-  const add = (value, priority) => {
+  const add = (value, priority, percentEncoded) => {
     if (value.length > 0 && !seen.has(value)) {
       seen.add(value);
-      variants.push({ value, priority });
+      variants.push({ value, priority, percentEncoded });
     }
   };
   const base64 = base64EncodeUtf8(secret, false);
   const base64Url = base64EncodeUtf8(secret, true);
-  add(secret, 0);
-  add(percentEncodeUtf8(secret, false), 1);
-  add(percentEncodeUtf8(secret, true), 2);
-  add(base64, 3);
-  add(base64.replace(/=+$/u, ''), 4);
-  add(base64Url, 5);
-  add(base64Url.replace(/=+$/u, ''), 6);
+  add(secret, 0, false);
+  add(percentEncodeUtf8(secret), 1, true);
+  add(formPercentEncodeUtf8(secret), 2, true);
+  add(base64, 3, false);
+  add(base64.replace(/=+$/u, ''), 4, false);
+  add(base64Url, 5, false);
+  add(base64Url.replace(/=+$/u, ''), 6, false);
   return variants;
 }
 
@@ -624,7 +687,7 @@ function redactExtraSecrets(text, cfg) {
   for (const secret of cfg.extraSecrets) patterns.push(...secretVariants(secret));
   patterns.sort((a, b) => b.value.length - a.value.length || a.priority - b.priority);
   let output = text;
-  for (const pattern of patterns) output = replaceExactAll(output, pattern.value, cfg.replacement);
+  for (const pattern of patterns) output = replaceExactAll(output, pattern.value, cfg.replacement, pattern.percentEncoded);
   return output;
 }
 
@@ -750,6 +813,20 @@ function looksLikeTokenShape(token) {
   return hasDigit || hasSymbol;
 }
 
+function hasAuthorizationHeaderContext(text, index) {
+  let cursor = index - 1;
+  while (cursor >= 0 && (text.charCodeAt(cursor) === 32 || text.charCodeAt(cursor) === 9)) cursor -= 1;
+  if (cursor < 0 || text.charCodeAt(cursor) !== 58) return false;
+  cursor -= 1;
+  while (cursor >= 0 && (text.charCodeAt(cursor) === 32 || text.charCodeAt(cursor) === 9)) cursor -= 1;
+  const word = 'authorization';
+  const start = cursor - word.length + 1;
+  if (start < 0 || !startsWithAsciiCaseInsensitiveAt(text, start, word)) return false;
+  if (start === 0) return true;
+  const before = text.charCodeAt(start - 1);
+  return !isAsciiAlphaNumeric(before) && before !== 95;
+}
+
 function redactAuthSchemeTokens(text, replacement) {
   let output = '';
   let index = 0;
@@ -772,7 +849,8 @@ function redactAuthSchemeTokens(text, replacement) {
     const tokenStart = cursor;
     while (cursor < text.length && isBearerTokenChar(text.charCodeAt(cursor))) cursor += 1;
     const token = text.slice(tokenStart, cursor);
-    if (!looksLikeTokenShape(token)) {
+    const authorizationContext = hasAuthorizationHeaderContext(text, index);
+    if (token.length === 0 || (!authorizationContext && !looksLikeTokenShape(token))) {
       output += text[index];
       index += 1;
       continue;
@@ -881,7 +959,7 @@ function redactGenericKeyValues(text, replacement) {
         valueEnd += 1;
       }
       const valueLength = valueEnd - valueStart;
-      if (valueLength >= 4) {
+      if (valueLength > 0) {
         output += text.slice(index, valueStart) + replacement;
         if (closed) output += text[valueEnd];
         index = closed ? valueEnd + 1 : valueEnd;
@@ -899,7 +977,7 @@ function redactGenericKeyValues(text, replacement) {
       if (code <= 32 || code === 44 || code === 59 || code === 38 || code === 34 || code === 39) break;
       valueEnd += 1;
     }
-    if (valueEnd - valueStart >= 4) {
+    if (valueEnd > valueStart) {
       output += text.slice(index, valueStart) + replacement;
       index = valueEnd;
     } else {
@@ -910,7 +988,7 @@ function redactGenericKeyValues(text, replacement) {
   return output;
 }
 
-const JWT_RE = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])/g;
+const JWT_RE = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]+\.(?:[A-Za-z0-9_-]{8,})?(?![A-Za-z0-9_-])/g;
 
 const VENDOR_TOKEN_PATTERNS = Object.freeze([
   /(?<![A-Z0-9])(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[A-Z0-9]{16}(?![A-Z0-9])/g,
@@ -1039,8 +1117,9 @@ export function redactSecrets(text, options) {
 
 function sanitizeAndRedactString(text, cfg) {
   const initiallyRedacted = redactSecretsCore(text, cfg);
-  const canonical = sanitizeLineCore(initiallyRedacted, cfg);
-  return redactSecretsCore(canonical, cfg);
+  const canonical = canonicalizeLine(initiallyRedacted, cfg);
+  const redacted = redactSecretsCore(canonical, cfg);
+  return truncateCanonicalText(redacted, cfg);
 }
 
 function normalizeObjectPathSegment(key) {
@@ -1116,6 +1195,8 @@ function readOwnEnumerableKeys(value) {
   return keys;
 }
 
+const ERROR_STANDARD_PROPERTY_KEYS = new Set(['name', 'message', 'code', 'stack', 'errors', 'cause']);
+
 function sanitizeErrorValue(value, depth, path, state, cfg) {
   const output = Object.create(null);
   const name = typeof value.name === 'string' ? value.name : 'Error';
@@ -1137,12 +1218,23 @@ function sanitizeErrorValue(value, depth, path, state, cfg) {
     setOutputKey(output, 'stack', '[Unreadable]');
   }
   try {
+    if ('errors' in value) {
+      const errorsValue = value.errors;
+      if (errorsValue !== undefined) {
+        setOutputKey(output, 'errors', sanitizeValue(errorsValue, depth + 1, path.concat('errors'), state, cfg));
+      }
+    }
+  } catch {
+    setOutputKey(output, 'errors', '[Unreadable]');
+  }
+  try {
     if ('cause' in value) {
       setOutputKey(output, 'cause', sanitizeValue(value.cause, depth + 1, path.concat('cause'), state, cfg));
     }
   } catch {
     setOutputKey(output, 'cause', '[Unreadable]');
   }
+  copyEnumerableProperties(value, output, depth, path, state, cfg, ERROR_STANDARD_PROPERTY_KEYS);
   return output;
 }
 
@@ -1216,8 +1308,7 @@ function sanitizeSetValue(value, depth, path, state, cfg) {
   return output;
 }
 
-function sanitizePlainObjectValue(value, depth, path, state, cfg) {
-  const output = Object.create(null);
+function copyEnumerableProperties(value, output, depth, path, state, cfg, skippedSegments) {
   const keys = readOwnEnumerableKeys(value);
   const count = Math.min(keys.length, cfg.maxKeys);
   for (let position = 0; position < count; position += 1) {
@@ -1229,6 +1320,7 @@ function sanitizePlainObjectValue(value, depth, path, state, cfg) {
 
     const rawSegment = normalizeObjectPathSegment(keyText);
     const safeSegment = normalizeObjectPathSegment(safeKey);
+    if (skippedSegments !== undefined && (skippedSegments.has(keyText) || skippedSegments.has(safeKey))) continue;
     const childPath = path.concat(safeSegment);
     const rawChildPath = path.concat(rawSegment);
     const sensitive = cfg.sensitiveKeys.has(rawSegment) || cfg.sensitiveKeys.has(safeSegment) ||
@@ -1250,6 +1342,11 @@ function sanitizePlainObjectValue(value, depth, path, state, cfg) {
     setOutputKey(output, safeKey, child);
   }
   if (keys.length > cfg.maxKeys) setOutputKey(output, '[truncated]', String(keys.length - cfg.maxKeys) + ' more');
+}
+
+function sanitizePlainObjectValue(value, depth, path, state, cfg) {
+  const output = Object.create(null);
+  copyEnumerableProperties(value, output, depth, path, state, cfg);
   return output;
 }
 
@@ -1303,7 +1400,12 @@ function sanitizeValue(value, depth, path, state, cfg) {
   if (type === 'bigint') return value.toString() + 'n';
   if (type === 'symbol') return sanitizeAndRedactString(symbolDescription(value), cfg);
   if (type === 'function') {
-    const name = typeof value.name === 'string' && value.name.length > 0 ? ' ' + value.name : '';
+    let name = '';
+    try {
+      name = typeof value.name === 'string' && value.name.length > 0 ? ' ' + value.name : '';
+    } catch {
+      name = '';
+    }
     return sanitizeAndRedactString('[Function' + name + ']', cfg);
   }
   if (type === 'object') return sanitizeContainer(value, depth, path, state, cfg);

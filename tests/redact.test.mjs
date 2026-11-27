@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { performance } from 'node:perf_hooks';
 import { esm, throwsCode, shapedJwt, syntheticVendorSecrets } from './helpers.mjs';
 
 const { CODE, redactSecrets } = esm;
@@ -54,7 +55,10 @@ for (const [name, input, expected] of [
   ['bearer punctuation token', 'Bearer abc-def_123', 'Bearer ' + R],
   ['multiple spaces', 'Bearer   abcdefgh12345678', 'Bearer   ' + R],
   ['tab after bearer', 'Bearer\tabcdefgh12345678', 'Bearer\t' + R],
-  ['text after token', 'Bearer abcdefgh12345678 done', 'Bearer ' + R + ' done']
+  ['text after token', 'Bearer abcdefgh12345678 done', 'Bearer ' + R + ' done'],
+  ['authorization bearer alphabetic opaque token', 'Authorization: Bearer abcdefghijklmnop', 'Authorization: Bearer ' + R],
+  ['authorization basic alphabetic opaque token', 'Authorization: Basic abcdefghijklmnop', 'Authorization: Basic ' + R],
+  ['lowercase authorization bearer alphabetic token', 'authorization: bearer abcdefghijklmnop', 'authorization: bearer ' + R]
 ]) {
   test('auth token redaction: ' + name, () => {
     assert.equal(redactSecrets(input), expected);
@@ -129,7 +133,10 @@ for (const [name, input, expected] of [
   ['bare jwt', shapedJwt(), R],
   ['jwt in sentence', 'token ' + shapedJwt() + ' end', 'token ' + R + ' end'],
   ['jwt after equals', 'jwt=' + shapedJwt(), 'jwt=' + R],
-  ['jwt twice', shapedJwt() + ' ' + shapedJwt(), R + ' ' + R]
+  ['jwt twice', shapedJwt() + ' ' + shapedJwt(), R + ' ' + R],
+  ['jwt base64url punctuation', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlXy12', R],
+  ['jwt empty signature', 'eyJhbGciOiJub25lIn0.e30.', R],
+  ['jwt short payload', 'eyJhbGciOiJIUzI1NiJ9.e30.c2lnbmF0dXJl', R]
 ]) {
   test('JWT redaction: ' + name, () => {
     assert.equal(redactSecrets(input), expected);
@@ -138,7 +145,9 @@ for (const [name, input, expected] of [
 
 for (const [name, input] of [
   ['two-part token', 'abc.def'],
+  ['two-part jwt-shaped token', 'eyJhbGciOiJub25lIn0.e30'],
   ['short jwt-shaped token', 'eyJabc.defghijklm.uvwxyz'],
+  ['too-short jwt signature', 'eyJhbGciOiJIUzI1NiJ9.e30.abc'],
   ['ordinary dotted text', 'aaaaaaaaa.bbbbbbbbb.ccccccccc'],
   ['jwt prefix embedded in word', 'x' + shapedJwt()]
 ]) {
@@ -213,7 +222,11 @@ for (const [name, input, expected] of [
   ['value stops at whitespace', 'token=abcdef next=1', 'token=' + R + ' next=1'],
   ['uppercase key', 'PASSWORD=abcdef', 'PASSWORD=' + R],
   ['mixed separator key', 'a-p-i_k-e-y=abcdef', 'a-p-i_k-e-y=' + R],
-  ['x api key header', 'x-api-key: abcdef', 'x-api-key: ' + R]
+  ['x api key header', 'x-api-key: abcdef', 'x-api-key: ' + R],
+  ['short unquoted password', 'password=abc', 'password=' + R],
+  ['one character unquoted token', 'token=x', 'token=' + R],
+  ['short quoted password', 'password="abc"', 'password="' + R + '"'],
+  ['one character quoted api key', 'api_key=\'x\'', 'api_key=\'' + R + '\'']
 ]) {
   test('generic key-value redaction: ' + name, () => {
     assert.equal(redactSecrets(input), expected);
@@ -225,7 +238,6 @@ for (const [name, input] of [
   ['tokenize', 'tokenize=abcdef'],
   ['secretary', 'secretary=abcdef'],
   ['password prose', 'the password is abcdef'],
-  ['password short value', 'password=abc'],
   ['token empty value', 'token='],
   ['unrelated key', 'username=abcdef']
 ]) {
@@ -244,6 +256,10 @@ for (const [name, input, secret, expected] of [
   ['space percent encoded', 'a%20b', 'a b', R],
   ['unicode uppercase percent', 'x%C3%A9y', 'xéy', R],
   ['unicode lowercase percent', 'x%c3%a9y', 'xéy', R],
+  ['mixed case percent triplets', 'x%C3%a9%2Fy%20z', 'xé/y z', R],
+  ['form plus space', 'a+b', 'a b', R],
+  ['form plus and mixed percent', 'a+b%2fC', 'a b/C', R],
+  ['reserved character percent encoding', 'a%21b%28c%29', 'a!b(c)', R],
   ['overlapping longest first', 'abcdef', 'abcdef', R],
   ['custom replacement exact', 'abc', 'abc', '<mask>']
 ]) {
@@ -361,4 +377,17 @@ test('redaction is idempotent for a second pass', () => {
 
 test('custom replacement is used across built-in detectors', () => {
   assert.equal(redactSecrets('token=abcdef', { replacement: '<hidden>' }), 'token=<hidden>');
+});
+
+test('64 extra secrets over 100KB remain linear and bounded', () => {
+  const secrets = Array.from({ length: 64 }, (_, index) => 'synthetic-' + index + '-' + 'x'.repeat(32));
+  const input = 'prefix '.repeat(2000) + 'a/b a+b ' + 'z'.repeat(100000);
+  let best = Infinity;
+  for (let round = 0; round < 3; round += 1) {
+    const start = performance.now();
+    const output = redactSecrets(input, { extraSecrets: secrets });
+    best = Math.min(best, performance.now() - start);
+    assert.equal(output.length > 100000, true);
+  }
+  assert.ok(best < 1500, '64-secret 100KB redaction best-of-three took ' + best.toFixed(3) + 'ms');
 });

@@ -42,6 +42,19 @@ test('function root conversion is deterministic', () => {
   assert.equal(sanitizeLogRecord(() => {}).startsWith('[Function'), true);
 });
 
+test('function with throwing proxy name fails closed to anonymous function marker', () => {
+  const input = new Proxy(function synthetic() {}, {
+    get() { throw new Error('get trap ran'); }
+  });
+  assert.equal(sanitizeLogRecord(input), '[Function]');
+});
+
+test('revoked proxy function fails closed to anonymous function marker', () => {
+  const revoked = Proxy.revocable(function synthetic() {}, {});
+  revoked.revoke();
+  assert.equal(sanitizeLogRecord(revoked.proxy), '[Function]');
+});
+
 for (const [label, options] of [
   ['unknown key', { nope: true }],
   ['bad maxDepth type', { maxDepth: '1' }],
@@ -242,6 +255,24 @@ test('direct secrets are redacted before truncation can expose a prefix boundary
   assert.equal(output.message.includes('abcdefgh'), false);
 });
 
+for (const mode of ['escape', 'strip']) {
+  test('ANSI-obfuscated extra secret is redacted before truncation in ' + mode + ' mode', () => {
+    const secret = 'syntheticSecret1234567890AB';
+    const input = 'syn' + '\x1b[31m' + 'theticSecret1234567890AB';
+    const output = sanitizeLogRecord({ message: input }, { mode, maxLength: 16, extraSecrets: [secret] });
+    assert.equal(output.message, R);
+    assert.equal(output.message.includes('synth'), false);
+  });
+}
+
+test('control-obfuscated extra secret is redacted before truncation in strip mode', () => {
+  const secret = 'syntheticSecret1234567890AB';
+  const input = 'syn' + String.fromCharCode(0) + 'theticSecret1234567890AB';
+  const output = sanitizeLogRecord({ message: input }, { mode: 'strip', maxLength: 16, extraSecrets: [secret] });
+  assert.equal(output.message, R);
+  assert.equal(output.message.includes('synth'), false);
+});
+
 test('PII options apply inside record strings', () => {
   const output = sanitizeLogRecord({ email: 'a@example.com' }, { pii: { email: true }, sensitiveKeys: [] });
   assert.equal(output.email, R);
@@ -320,6 +351,37 @@ test('Error cause circular reference is bounded', () => {
   error.cause = error;
   const output = sanitizeLogRecord(error);
   assert.equal(output.cause, '[Circular]');
+});
+
+test('AggregateError errors are preserved recursively and sanitized', () => {
+  const inner = new Error('inner\nmessage');
+  inner.stack = 'synthetic inner stack';
+  const aggregate = new AggregateError([inner], 'outer\nmessage');
+  const output = sanitizeLogRecord(aggregate);
+  assert.equal(output.name, 'AggregateError');
+  assert.equal(output.message, 'outer\\nmessage');
+  assert.equal(Array.isArray(output.errors), true);
+  assert.equal(output.errors.length, 1);
+  assert.equal(output.errors[0].message, 'inner\\nmessage');
+  assert.equal(output.errors[0].stack, 'synthetic inner stack');
+});
+
+test('Error custom enumerable properties are copied through the safe record pipeline', () => {
+  const error = new Error('bad');
+  error.details = { token: 'synthetic-token-value', safe: 'ok\nvalue' };
+  error.requestId = 'req-1';
+  const output = sanitizeLogRecord(error);
+  assert.equal(output.requestId, 'req-1');
+  assert.equal(output.details.token, R);
+  assert.equal(output.details.safe, 'ok\\nvalue');
+});
+
+test('Error custom dangerous properties are omitted', () => {
+  const error = new Error('bad');
+  Object.defineProperty(error, '__proto__', { value: { polluted: true }, enumerable: true, configurable: true });
+  const output = sanitizeLogRecord(error);
+  assert.equal(Object.keys(output).includes('__proto__'), false);
+  assert.equal(Object.prototype.polluted, undefined);
 });
 
 test('direct circular object reference is bounded', () => {

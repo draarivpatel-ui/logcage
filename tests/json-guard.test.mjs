@@ -146,6 +146,25 @@ test('oversized NDJSON output fails closed', () => {
   assert.equal(error.actual > 1024, true);
 });
 
+test('maxOutputBytes is enforced in UTF-8 bytes rather than UTF-16 code units', () => {
+  const error = throwsCode(() => formatSafeJsonLog('info', 'é'.repeat(500), undefined, {
+    timestamp: fixedNow(),
+    maxOutputBytes: 1024
+  }), CODE.LIMIT_EXCEEDED);
+  assert.equal(error.actual > 1024, true);
+});
+
+test('NDJSON redacts an ANSI-obfuscated extra secret before truncation', () => {
+  const secret = 'syntheticSecret1234567890AB';
+  const input = 'syn' + '\x1b[31m' + 'theticSecret1234567890AB';
+  const parsed = parseLine(formatSafeJsonLog('info', input, undefined, {
+    timestamp: fixedNow(),
+    maxLength: 16,
+    extraSecrets: [secret]
+  }));
+  assert.equal(parsed.msg, R);
+});
+
 test('formatSafeJsonLog rejects unknown options', () => {
   throwsCode(() => formatSafeJsonLog('info', 'x', undefined, { nope: true }), CODE.INVALID_OPTIONS);
 });

@@ -12,7 +12,7 @@ Zero-dependency CWE-117 log injection, terminal escape sanitization and automati
 - **Secret masking.** Authorization tokens, cookies, URL userinfo, JWTs, PEM private key blocks, common vendor token shapes and caller-supplied secrets are replaced with `[REDACTED]`.
 - **Structured defense.** Sensitive keys are redacted, dangerous object keys are omitted, circular references are bounded, and depth, key, array and node limits are enforced.
 
-**Tests:** 700 passing with `npm test` (Node 18+).
+**Tests:** 726 passing with `npm test` (Node 18+).
 
 ## Install
 
@@ -89,7 +89,7 @@ Redacts sensitive values in a string without otherwise sanitizing it. This funct
 
 Built-in detectors cover:
 
-- `Authorization: Bearer ...` and `Authorization: Basic ...` style tokens, including common standalone Bearer or Basic token uses.
+- `Authorization: Bearer ...` and `Authorization: Basic ...` header tokens. Standalone Bearer or Basic uses are redacted when they have a token-like shape; the Authorization header context is stricter and redacts every non-empty token.
 - `Cookie:` and `Set-Cookie:` values through the end of their line.
 - URL userinfo, so `https://user:pass@example.test/path` becomes `https://[REDACTED]@example.test/path`.
 - Three-part JSON Web Tokens with a JSON-looking `eyJ` header segment.
@@ -102,7 +102,7 @@ Options:
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `replacement` | `'[REDACTED]'` | Replacement text. Controls, format characters and lone surrogates are rejected. |
-| `extraSecrets` | `[]` | Up to 64 exact caller secrets, each up to 4096 UTF-16 code units. Matches include the exact value, lowercase percent-encoding, uppercase percent-encoding, standard base64, unpadded standard base64, URL-safe base64 and unpadded URL-safe base64. Longer forms are replaced before shorter overlapping forms. |
+| `extraSecrets` | `[]` | Up to 64 exact caller secrets, each up to 4096 UTF-16 code units. Matches include the exact value, percent-encoding with case-insensitive hex digits, form encoding with `+` for spaces, standard base64, unpadded standard base64, URL-safe base64 and unpadded URL-safe base64. Longer forms are replaced before shorter overlapping forms. |
 | `pii` | all false | Optional detectors. `email`, `luhnCard`, `ssn` and `ipv4` are independent booleans. |
 
 PII detectors are conservative:
@@ -129,7 +129,7 @@ Type handling:
 | `undefined` | `null` |
 | `symbol` | sanitized `Symbol(description)` text |
 | function | sanitized `[Function name]` or `[Function]` text |
-| `Error` | object preserving sanitized `name`, `message`, optional `code`, optional sanitized `stack` and recursive `cause` |
+| `Error` | object preserving sanitized `name`, `message`, optional `code`, optional sanitized `stack`, recursive `errors` and `cause`, plus enumerable custom properties through the same safe pipeline |
 | `Date` | ISO string, or `[Invalid Date]` |
 | `URL` | sanitized and redacted href, including userinfo redaction |
 | array | array bounded by `maxArrayLength` |
@@ -197,6 +197,7 @@ Within the documented input and option limits:
 - Complete and unterminated ANSI/terminal control sequences cannot survive into output as executable sequences.
 - Unicode bidi override and isolate controls do not survive into output.
 - `formatSafeJsonLog` returns either one newline-free JSON string or no string at all.
+- Structured strings are redacted after terminal and control canonicalization but before output truncation, so a truncation boundary cannot expose the prefix of a canonicalized caller-supplied secret.
 - Record sanitization does not mutate its input and strips keys that are dangerous for object construction.
 - Options and errors never echo raw untrusted log text or secret values.
 - Scanning is iterative or uses bounded, non-nested patterns. The line sanitizer's terminal parser is a character-code state machine.
@@ -209,6 +210,7 @@ Within the documented input and option limits:
 - PII detectors are optional and conservative. They are not a general data-loss-prevention system.
 - Key-value secret detection expects ASCII `:` or `=` separators. Prose such as "the password is ..." is not treated as a key-value leak.
 - Circular references are detected along the active object ancestry. A repeated non-circular object is copied again, subject to `maxNodes`.
+- Typed arrays, including Node.js Buffer values, are represented as bounded numeric arrays. They are not decoded as strings for secret detection, so do not log secret-bearing binary data outside a sensitive key.
 - Getter methods and proxies are same-process JavaScript objects and can have side effects before this library can inspect them. Use plain data for fully untrusted records.
 - This library does not validate log transport integrity, encrypt logs, or protect secrets already stored in a downstream log system.
 

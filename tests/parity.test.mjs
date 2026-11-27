@@ -191,7 +191,7 @@ test('gitattributes enforces LF for TypeScript declarations', () => {
 
 test('CI covers Node 18 20 22 and 24 on Linux and Windows', () => {
   const ci = fs.readFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), 'utf8');
-  assert.match(ci, /os: \[ubuntu-latest, windows-latest\]/);
+  assert.match(ci, /os: \[ubuntu-24\.04, windows-latest\]/);
   assert.match(ci, /node: \[18, 20, 22, 24\]/);
   assert.match(ci, /node --test tests\/\*\.test\.mjs/);
 });

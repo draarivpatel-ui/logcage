@@ -59,7 +59,7 @@ export interface PiiRedactionOptions {
 export interface RedactSecretsOptions {
   /** Replacement inserted for every detected secret or enabled PII value. Default [REDACTED]. */
   replacement?: string;
-  /** Exact caller secrets, also matched in percent-encoded lowercase, percent-encoded uppercase and base64 forms. Maximum 64 entries. */
+  /** Exact caller secrets, also matched in percent-encoded form with case-insensitive hex digits, form-encoded spaces and base64 forms. Maximum 64 entries. */
   extraSecrets?: readonly string[];
   /** Optional high-precision PII detectors. All are off by default. */
   pii?: PiiRedactionOptions;
